@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fold</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500&family=JetBrains+Mono:wght@400&display=swap" />
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; }
+      body {
+        background-color: #FAFAF8;
+        background-image:
+          linear-gradient(rgba(0,0,0,.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0,0,0,.045) 1px, transparent 1px);
+        background-size: 24px 24px;
+        background-position: center center;
+        font-family: Inter, system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      #stage { position: fixed; inset: 0; display: block; touch-action: none; cursor: grab; }
+      #stage:active { cursor: grabbing; }
+      .x-dock {
+        position: fixed; left: 50%; bottom: max(32px, env(safe-area-inset-bottom));
+        transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 10px;
+      }
+      .x-label { font: 400 12px/1 "JetBrains Mono", ui-monospace, monospace; color: #5f5f5c; letter-spacing: .02em; min-height: 12px; }
+      .x-btn {
+        font: 500 15px/1 Inter, system-ui, sans-serif; color: #1a1a1a;
+        height: 44px; min-width: 112px; padding: 0 28px; border-radius: 999px; cursor: pointer;
+        background: rgba(255,255,255,.4);
+        -webkit-backdrop-filter: blur(24px) saturate(180%); backdrop-filter: blur(24px) saturate(180%);
+        border: 1px solid rgba(0,0,0,.08);
+        box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06);
+        transition: transform .15s ease, box-shadow .2s ease;
+      }
+      .x-btn:hover { box-shadow: 0 1px 2px rgba(0,0,0,.05), 0 10px 28px rgba(0,0,0,.09); }
+      .x-btn:active { transform: scale(.96); }
+      .x-btn:focus-visible { outline: 2px solid #2B4BFF; outline-offset: 3px; }
+      @media (prefers-reduced-motion: reduce) { .x-btn { transition: none; } }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+  </head>
+  <body>
+    <canvas id="stage" aria-label="A square sheet of paper that folds into shapes" role="img"></canvas>
+    <div class="x-dock">
+      <p class="x-label" id="label" aria-live="polite">square sheet</p>
+      <button class="x-btn" id="fold" type="button">Fold</button>
+    </div>
+
+    <script>
+    (function () {
+      // If three.js or WebGL is unavailable, the button still folds/unfolds the label state.
+      try { init(); return; } catch (err) { console.warn("Fold: 3D unavailable", err); }
+      const fb = document.getElementById("fold"), fl = document.getElementById("label");
+      const names = ["pinwheel", "fortune teller", "balloon", "frog"];
+      let isFolded = false, prev = null;
+      const toggle = () => {
+        isFolded = !isFolded;
+        if (isFolded) { const pool = names.filter((n) => n !== prev); prev = pool[Math.floor(Math.random() * pool.length)]; }
+        fb.textContent = isFolded ? "Unfold" : "Fold";
+        fl.textContent = isFolded ? prev : "square sheet";
+      };
+      fb.addEventListener("click", toggle);
+      addEventListener("keydown", (e) => {
+        if ((e.code === "Space" || e.key === "Enter") && e.target !== fb && !e.repeat) { e.preventDefault(); toggle(); }
+      });
+    })();
+    function init() {
+      const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const canvas = document.getElementById("stage");
+      const btn = document.getElementById("fold");
+      const label = document.getElementById("label");
+
+      // ---- scene ----
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 50);
+      camera.position.set(0, 3.2, 4.6);
+      camera.lookAt(0, -0.1, 0);
+
+      // r147 uses legacy light units, so intensities sit lower than in r155+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.62));
+      const key = new THREE.DirectionalLight(0xffffff, 0.55);
+      key.position.set(1.8, 5, 2.4);
+      key.castShadow = true;
+      key.shadow.mapSize.set(2048, 2048);
+      key.shadow.radius = 8;
+      key.shadow.bias = -0.0005;
+      Object.assign(key.shadow.camera, { left: -3, right: 3, top: 3, bottom: -3, near: 0.5, far: 15 });
+      scene.add(key);
+
+      const ground = new THREE.Mesh(new THREE.PlaneGeometry(20, 20), new THREE.ShadowMaterial({ opacity: 0.12 }));
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.y = -0.9;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      // ---- sheet: (N+1)^2 grid, triangulated along the diagonals ----
+      const N = 24, H = N / 2, V = (N + 1) * (N + 1);   // 24: about double the balloon's facets
+      const id = (i, j) => j * (N + 1) + i;
+      const base = new Float32Array(V * 3);
+      for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) {
+        const k = id(i, j) * 3;
+        base[k] = -1 + (2 * i) / N; base[k + 1] = -1 + (2 * j) / N; base[k + 2] = 0;
+      }
+      const tris = [];
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const a = id(i, j), b = id(i + 1, j), c = id(i + 1, j + 1), d = id(i, j + 1);
+        if ((i < H) === (j < H)) tris.push(a, b, c, a, c, d);
+        else tris.push(a, b, d, b, c, d);
+      }
+      const geo = new THREE.BufferGeometry();
+      const pos = new THREE.BufferAttribute(base.slice(), 3);
+      pos.setUsage(THREE.DynamicDrawUsage);
+      geo.setAttribute("position", pos);
+      geo.setIndex(tris);
+      geo.computeVertexNormals();
+
+      const paper = new THREE.MeshStandardMaterial({
+        color: 0xf2f0ea, roughness: 0.92, metalness: 0, side: THREE.DoubleSide, flatShading: true,
+        polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+      });
+      const mesh = new THREE.Mesh(geo, paper);
+      mesh.castShadow = true;
+
+      // crease lines share the sheet's position buffer
+      const lineIdx = [];
+      for (let k = 0; k < N; k++) {
+        lineIdx.push(id(k, H), id(k + 1, H), id(H, k), id(H, k + 1));
+        lineIdx.push(id(k, k), id(k + 1, k + 1), id(k, N - k), id(k + 1, N - k - 1));
+        lineIdx.push(id(k, 0), id(k + 1, 0), id(k, N), id(k + 1, N), id(0, k), id(0, k + 1), id(N, k), id(N, k + 1));
+      }
+      const lineGeo = new THREE.BufferGeometry();
+      lineGeo.setAttribute("position", pos);
+      lineGeo.setIndex(lineIdx);
+      const CREASE_OP = 1;
+      const creases = new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({ color: 0xb5b5b3, transparent: true, opacity: CREASE_OP }));
+
+      // extra balloon creases on the quarter lines, faded in as it folds (doubles the crease lines)
+      const bLineIdx = [];
+      for (let k = 0; k < N; k++) for (const q of [N / 4, (3 * N) / 4]) bLineIdx.push(id(k, q), id(k + 1, q), id(q, k), id(q, k + 1));
+      const bLineGeo = new THREE.BufferGeometry();
+      bLineGeo.setAttribute("position", pos);
+      bLineGeo.setIndex(bLineIdx);
+      const bCreases = new THREE.LineSegments(bLineGeo, creases.material.clone());
+      bCreases.visible = false;
+
+      const spin = new THREE.Group();   // after-life spin, around the sheet's normal
+      spin.add(mesh, creases, bCreases);
+      const tilt = new THREE.Group();   // lays the sheet down, facing the camera
+      tilt.rotation.x = -Math.PI / 2 + 0.28;
+      tilt.add(spin);
+      const orbit = new THREE.Group();  // drag + idle float
+      orbit.add(tilt);
+      scene.add(orbit);
+
+      // ---- shapes ----
+      const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+      // Balloon (waterbomb): the sheet wraps up and around a ball so every edge meets at a small top ring
+      // (the blow hole), then settles into a slightly deflated cube
+      const BR = 0.55, BGAP = 0.35, BDROP = 0.1, BSCALE = 0.69;   // inflated: 1.09 x 1.07 unscaled -> 0.75 x 0.74
+      const faceness = (ux, uy, uz) => {   // 0 at cube edges/corners, 1 at face centres (u is unit)
+        const m = Math.max(Math.abs(ux), Math.abs(uy), Math.abs(uz));
+        return { m, c: smooth(0.8, 1, m) };
+      };
+      const balloon = (x, y, t) => {
+        const s = Math.max(Math.abs(x), Math.abs(y));
+        if (s < 1e-6) return [0, 0, 0];
+        const th = Math.atan2(y, x), cx = Math.cos(th), cy = Math.sin(th);
+        // direction: square ring at t=0, circle at t=1
+        const wx = x / s + (cx - x / s) * t, wy = y / s + (cy - y / s) * t;
+        // roll the sheet onto a curve whose curvature grows with t
+        const k = t / BR, L = s * (1 + (BR * (Math.PI - BGAP) - 1) * t);
+        const phi = L * k;
+        const rho = k > 1e-5 ? Math.sin(phi) / k : L;
+        const z = k > 1e-5 ? (1 - Math.cos(phi)) / k : 0;
+        let px = wx * rho, py = wy * rho, pz = z;
+        // final shaping: sphere -> rounded, slightly concave cube, phased in late
+        const w = smooth(0.55, 1, t);
+        if (w > 0) {
+          const ph = s * (Math.PI - BGAP);
+          const ux = Math.sin(ph) * cx, uy = Math.sin(ph) * cy, uz = -Math.cos(ph);
+          const { m, c } = faceness(ux, uy, uz);
+          const rad = (BR * 0.45 + (0.45 / m) * 0.55) * (1 - 0.1 * c);
+          const d = (rad - BR) * w;
+          px += ux * d; py += uy * d; pz += uz * d - BDROP * w;
+        }
+        return [px, py, pz];
+      };
+
+      // split a triangle into 4 at its edge midpoints; each midpoint is nudged up or down 0.01-0.02 by a
+      // hash of its position (|x|, so mirrored halves match and shared edges stay watertight)
+      const nudge = (p) => {
+        const h = Math.sin(Math.abs(p[0]) * 127.1 + p[1] * 311.7 + p[2] * 74.7) * 43758.5453;
+        const f = h - Math.floor(h);
+        return (f < 0.5 ? -1 : 1) * (0.01 + 0.02 * Math.abs(f - 0.5));
+      };
+      const mid = (p, q) => {
+        const m = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2];
+        m[2] += nudge(m);
+        return m;
+      };
+      const split4 = ([a, b, c]) => {
+        const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a);
+        return [[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]];
+      };
+
+      // Frog (jumping frog) as 72 rigid panels (18 faces, each split in 4). Local z is up; the head faces local -y (toward the viewer,
+      // which is also the direction the hop travels). ~0.9 wide, ~1.1 long, ~0.45 tall.
+      const frogTris = (() => {
+        const S = (x, y, z) => [x * 0.75, y * 0.86, z];
+        const M = (p) => [-p[0], p[1], p[2]];
+        const N = S(0, -0.56, 0.22), R1 = S(0, -0.3, 0.42), R2 = S(0, 0.15, 0.45), T = S(0, 0.5, 0.12); // nose + back ridge
+        const HL = S(-0.2, -0.38, 0.1), SL = S(-0.32, -0.05, 0.08);                                    // head + body side
+        const FL = [S(-0.18, -0.32, 0.08), S(-0.27, -0.14, 0.06), S(-0.48, -0.64, 0.01)];               // front leg
+        const H1 = S(-0.3, 0, 0.07), H2 = S(-0.18, 0.38, 0.14);                                        // hip
+        const K = S(-0.58, 0.02, 0.24), KL = S(-0.5, -0.1, 0.03);                                      // knee, out and up
+        const A = S(-0.4, 0.45, 0.05), F = S(-0.64, 0.68, 0.01), F2 = S(-0.34, 0.64, 0.01);            // ankle + foot
+        const left = [
+          [N, HL, R1], [HL, SL, R1], [SL, R2, R1], [SL, T, R2],   // head, shoulder, back, rump
+          FL,                                                     // front leg
+          [H1, K, H2], [H1, KL, K], [K, A, H2], [A, F, F2],       // Z-pleated hind leg
+        ];
+        const out = [];
+        left.forEach((t) => out.push(...split4(t), ...split4(t.map(M))));
+        return out;   // 72 panels
+      })();
+
+      // Pinwheel as 32 rigid panels: four identical blades in 90deg symmetry, ~1.1 across. Each blade is a
+      // quadrant cut on its diagonal: a flat base triangle plus a flap folded toward the centre, its tip
+      // raised ~0.18 to make a scoop. Each face is split into 4 for more facets (8 per blade).
+      const pinTris = (() => {
+        const R = 0.55, c = R * Math.SQRT1_2, ta = 1.26, tr = 0.36;
+        const O = [0, 0, 0.05], A = [c, 0, 0.015], B = [c, c, 0.02], T = [tr * Math.cos(ta), tr * Math.sin(ta), 0.18];
+        const mid = (p, q, dz = 0) => [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2 + dz];
+        const sub = (a, b, d, ab, bd, da) => [[a, ab, da], [ab, b, bd], [da, bd, d], [ab, bd, da]];
+        const blade = [
+          ...sub(O, A, B, mid(O, A), mid(A, B), mid(B, O)),                     // flat base
+          ...sub(O, B, T, mid(O, B), mid(B, T, 0.025), mid(T, O, -0.012)),      // raised flap, slightly cupped
+        ];
+        const out = [];
+        for (let k = 0; k < 4; k++) {
+          const cs = Math.round(Math.cos((k * Math.PI) / 2)), sn = Math.round(Math.sin((k * Math.PI) / 2));
+          blade.forEach((t) => out.push(t.map((p) => [p[0] * cs - p[1] * sn, p[0] * sn + p[1] * cs, p[2]])));
+        }
+        return out;
+      })();
+
+      // Fortune teller as 32 rigid panels, standing on its base: four tall pyramidal petals in a 2x2,
+      // ~1.1 across and ~0.55 tall, with a deep cross-shaped valley between them and the tips held a little
+      // apart. Each petal has 4 faces rising to its tip, each face split in 2 at its base midpoint.
+      const TELLER_H = 0.55;
+      const tellerTris = (() => {
+        const R = 0.55, g = 0.012, tp = 0.2;
+        const P = [[g, g, 0], [R, g, 0], [R, R, 0], [g, R, 0]], T = [tp, tp, TELLER_H];
+        const petal = [];
+        for (let k = 0; k < 4; k++) {
+          const a = P[k], b = P[(k + 1) % 4];
+          const outer = k === 1 || k === 2, d = outer ? 0.015 : -0.01;   // outer faces bow out a touch
+          const m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, 0.02];
+          if (k === 1) m[0] += d; else if (k === 2) m[1] += d; else if (k === 0) m[1] -= d; else m[0] -= d;
+          petal.push([a, m, T], [m, b, T]);
+        }
+        const out = [];
+        [[1, 1], [-1, 1], [-1, -1], [1, -1]].forEach(([sx, sy]) =>
+          petal.forEach((t) => out.push(t.map((p) => [p[0] * sx, p[1] * sy, p[2]]))));
+        return out;
+      })();
+
+      // matching source triangles: an n x n grid on the sheet, each square split in two (all wound +z)
+      const sheetGrid = (n) => {
+        const out = [], g = (k) => -1 + (2 * k) / n;
+        for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+          const a = [g(i), g(j), 0], b = [g(i + 1), g(j), 0], c = [g(i + 1), g(j + 1), 0], d = [g(i), g(j + 1), 0];
+          const ac = n % 2 ? (i + j) % 2 : (i < n / 2) === (j < n / 2);   // even grids: diagonals run to the centre
+          if (ac) out.push([a, b, c], [a, c, d]);
+          else out.push([a, b, d], [b, c, d]);
+        }
+        return out;
+      };
+
+      const V3 = (p) => new THREE.Vector3(p[0], p[1], p[2]);
+      const frame = (vs) => {   // centroid, orientation and in-plane shape of a triangle
+        const c = vs[0].clone().add(vs[1]).add(vs[2]).multiplyScalar(1 / 3);
+        const u = vs[1].clone().sub(vs[0]), w = vs[2].clone().sub(vs[0]);
+        const n = u.clone().cross(w).normalize(), e1 = u.normalize(), e2 = n.clone().cross(e1);
+        const q = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(e1, e2, n));
+        const qi = q.clone().invert();
+        return { c, q, l: vs.map((v) => v.clone().sub(c).applyQuaternion(qi)) };
+      };
+      // rigid-panel helper: target triangles flown in from matching sheet triangles, driven by prog.p
+      // `post(v, P)`, if given, moves each finished vertex (used for the teller's open/shut)
+      function panelSet(targetTris, sheetTris, sx, sy, parent, post) {
+      const panels = (() => {
+        const F = targetTris.map((t) => {
+          let v = t.map(V3);
+          const n = v[1].clone().sub(v[0]).cross(v[2].clone().sub(v[0]));
+          if (n.z < 0) v = [v[0], v[2], v[1]];   // face up, so no panel turns more than 90deg
+          return v;
+        });
+        const Sh = sheetTris.map((t) => t.map(V3));
+        const cen = (v) => v[0].clone().add(v[1]).add(v[2]).multiplyScalar(1 / 3);
+        // greedy match by position: target footprint normalised to the sheet
+        const pairs = [];
+        F.forEach((f, fi) => {
+          const fc = cen(f);
+          Sh.forEach((s, si) => { const sc = cen(s); pairs.push([Math.hypot(fc.x / sx - sc.x, fc.y / sy - sc.y), fi, si]); });
+        });
+        pairs.sort((a, b) => a[0] - b[0]);
+        const fUsed = new Set(), sUsed = new Set(), out = [];
+        for (const [, fi, si] of pairs) {
+          if (fUsed.has(fi) || sUsed.has(si)) continue;
+          fUsed.add(fi); sUsed.add(si);
+          const s = frame(Sh[si]);
+          let best = null;
+          for (let k = 0; k < 3; k++) {   // vertex order with the smallest turn
+            const f = frame([F[fi][k], F[fi][(k + 1) % 3], F[fi][(k + 2) % 3]]);
+            const ang = s.q.angleTo(f.q);
+            if (!best || ang < best.ang) best = { ang, f };
+          }
+          out.push({ cs: s.c, qs: s.q, ls: s.l, cf: best.f.c, qf: best.f.q, lf: best.f.l, r: Math.hypot(s.c.x, s.c.y) });
+        }
+        const rMax = Math.max(...out.map((P) => P.r));
+        out.forEach((P) => (P.r /= rMax));
+        return out;
+      })();
+
+      const fpArr = new Float32Array(panels.length * 9), feArr = new Float32Array(panels.length * 18);
+      const frogGeo = new THREE.BufferGeometry();
+      const fpPos = new THREE.BufferAttribute(fpArr, 3); fpPos.setUsage(THREE.DynamicDrawUsage);
+      frogGeo.setAttribute("position", fpPos);
+      const frogPanels = new THREE.Mesh(frogGeo, paper);
+      frogPanels.castShadow = true;
+      const feGeo = new THREE.BufferGeometry();
+      const fePos = new THREE.BufferAttribute(feArr, 3); fePos.setUsage(THREE.DynamicDrawUsage);
+      feGeo.setAttribute("position", fePos);
+      const frogEdges = new THREE.LineSegments(feGeo, creases.material.clone());
+      frogPanels.visible = frogEdges.visible = false;
+      parent.add(frogPanels, frogEdges);
+
+      function updateFrog(p) {
+        panels.forEach((P, i) => {
+          // centre panels lead, outer panels land exactly at p=1
+          const t = smooth(0, 1, p * 1.35 - P.r * 0.35);
+          _c.lerpVectors(P.cs, P.cf, t);
+          _c.z += t * (1 - t);   // lift arc, +0.25 at mid
+          _q.slerpQuaternions(P.qs, P.qf, t);
+          for (let k = 0; k < 3; k++) {
+            const v = _v[k].lerpVectors(P.ls[k], P.lf[k], t).applyQuaternion(_q).add(_c);
+            if (post) post(v, P);
+            fpArr.set([v.x, v.y, v.z], i * 9 + k * 3);
+          }
+          for (let k = 0; k < 3; k++) {
+            const a = _v[k], b = _v[(k + 1) % 3];
+            feArr.set([a.x, a.y, a.z, b.x, b.y, b.z], i * 18 + k * 6);
+          }
+        });
+        fpPos.needsUpdate = fePos.needsUpdate = true;
+        frogGeo.computeVertexNormals();
+        frogGeo.computeBoundingSphere();
+        feGeo.computeBoundingSphere();
+      }
+      return { mesh: frogPanels, edges: frogEdges, update: updateFrog };
+      }
+      const _q = new THREE.Quaternion(), _c = new THREE.Vector3(), _v = [0, 1, 2].map(() => new THREE.Vector3());
+
+      // the frog's afterLife moves `spin`, so it carries the panels
+      const frog = panelSet(frogTris, sheetGrid(6), 0.48, 0.57, spin);
+      // teller: "open" pulls the two petal pairs apart along x or y (life.axis) and tilts their tips outward
+      const life = { spin: 0, open: 0, axis: 0, puff: 0 };
+      const tellerOpen = (v, P) => {
+        const o = life.open;
+        if (!o) return;
+        const ax = life.axis ? "x" : "y", s = Math.sign(P.cf[ax]) || 1;
+        v[ax] += s * o * (0.075 + 0.08 * Math.max(0, v.z) / TELLER_H);
+        v.z *= 1 - 0.06 * o;
+      };
+      const tell = panelSet(tellerTris, sheetGrid(4), 0.55, 0.55, spin, tellerOpen);
+      // pinwheel: tilts up toward the camera as it folds; its afterLife spins pinSpin around the centre axis
+      const PIN_TILT = 0.15;
+      const pinTilt = new THREE.Group(), pinSpin = new THREE.Group();
+      pinTilt.add(pinSpin);
+      spin.add(pinTilt);
+      const pin = panelSet(pinTris, sheetGrid(4), 0.4, 0.4, pinSpin);
+      const panelSets = [frog, pin, tell];
+
+      let spinTween = null, openTween = null, puffTween = null, bounceTl = null, hopTl = null, settleTl = null;
+
+      const SHAPES = [
+        {
+          name: "pinwheel",
+          fn: null,
+          panels: pin,
+          afterLife: {
+            start() { spinTween = gsap.to(life, { spin: 1, duration: reduce ? 0 : 1.2, ease: "power1.in" }); },
+            stop() {
+              spinTween && spinTween.kill();
+              life.spin = 0;
+              const R = pinSpin.rotation, z = ((R.z % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+              R.z = z;
+              const target = z > Math.PI ? Math.PI * 2 : 0;
+              gsap.to(R, { z: target, duration: reduce ? 0 : 0.6, ease: "power2.inOut" });
+            },
+          },
+        },
+        {
+          name: "fortune teller",
+          fn: null,
+          panels: tell,
+          afterLife: {
+            start() {},
+            stop() { openTween && openTween.kill(); gsap.to(life, { open: 0, duration: reduce ? 0 : 0.25 }); },
+            click() {
+              openTween && openTween.kill();
+              const to = life.open > 0.5 ? 0 : 1;
+              if (to) life.axis = 1 - life.axis;   // each opening alternates x, then y
+              openTween = gsap.to(life, { open: to, duration: reduce ? 0 : 0.32, ease: to ? "back.out(2.2)" : "power3.in" });
+            },
+          },
+        },
+        {
+          name: "balloon",
+          fn: balloon,
+          afterLife: {
+            start() {
+              puffTween && puffTween.kill();
+              puffTween = gsap.to(life, { puff: 1, duration: reduce ? 0 : 0.9, ease: "elastic.out(1, 0.5)" });
+            },
+            stop() {
+              puffTween && puffTween.kill();
+              bounceTl && bounceTl.kill();
+              puffTween = gsap.to(life, { puff: 0, duration: reduce ? 0 : 0.2, ease: "power2.in" });
+              gsap.to(spin.position, { y: 0, z: 0, duration: reduce ? 0 : 0.2 });
+              gsap.to(spin.scale, { x: 1, y: 1, z: 1, duration: reduce ? 0 : 0.2 });
+            },
+            click() {
+              if (reduce) return;
+              bounceTl && bounceTl.kill();
+              // the spin group's local z is the sheet normal (world up after the tilt), so the hop runs along it
+              const P = spin.position, S = spin.scale;
+              P.z = 0; S.set(1, 1, 1);
+              bounceTl = gsap.timeline()
+                .to(P, { z: 0.35, duration: 0.24, ease: "power2.out" }, 0)
+                .to(S, { x: 0.93, y: 0.93, z: 1.15, duration: 0.12, ease: "power2.out" }, 0)
+                .to(S, { x: 1, y: 1, z: 1, duration: 0.12, ease: "power1.inOut" }, 0.12)
+                .to(P, { z: 0, duration: 0.2, ease: "power2.in" }, 0.24)
+                .to(S, { x: 1.1, y: 1.1, z: 0.85, duration: 0.07, ease: "power2.out" }, 0.44)
+                .to(S, { x: 1, y: 1, z: 1, duration: 0.09, ease: "back.out(3)" }, 0.51);
+            },
+          },
+        },
+        {
+          name: "frog",
+          fn: null,
+          panels: frog,
+          afterLife: {
+            start() {
+              if (reduce) return;
+              settleTl && settleTl.kill();
+              settleTl = gsap.timeline()
+                .to(spin.scale, { z: 0.9, duration: 0.14, ease: "power2.out" })
+                .to(spin.scale, { z: 1, duration: 0.26, ease: "back.out(2)" });
+            },
+            stop() {
+              hopTl && hopTl.kill(); settleTl && settleTl.kill();
+              hopTl = settleTl = null;
+              const d = reduce ? 0 : 0.2;
+              gsap.to(spin.position, { x: 0, y: 0, z: 0, duration: d });
+              gsap.to(spin.rotation, { x: 0, duration: d });
+              gsap.to(spin.scale, { x: 1, y: 1, z: 1, duration: d });
+            },
+            click() {
+              if (reduce || (hopTl && hopTl.isActive())) return;
+              settleTl && settleTl.kill();
+              // inside the tilt: local z is up, local -y is toward the viewer; negative rotation.x lifts the nose
+              const P = spin.position, R = spin.rotation, S = spin.scale;
+              hopTl = gsap.timeline()
+                .to(S, { x: 1.04, y: 1, z: 0.8, duration: 0.12, ease: "power2.out" }, 0)
+                // big hop forward
+                .to(S, { x: 1, z: 1.06, duration: 0.1, ease: "power2.out" }, 0.12)
+                .to(P, { z: 0.5, duration: 0.22, ease: "power2.out" }, 0.12)
+                .to(P, { y: -0.4, duration: 0.44, ease: "none" }, 0.12)
+                .to(R, { x: -0.3, duration: 0.22, ease: "power2.out" }, 0.12)
+                .to(S, { z: 1, duration: 0.12 }, 0.22)
+                .to(P, { z: 0, duration: 0.22, ease: "power2.in" }, 0.34)
+                .to(R, { x: 0, duration: 0.2, ease: "power1.in" }, 0.36)
+                .to(S, { x: 1.1, y: 1.05, z: 0.85, duration: 0.07, ease: "power2.out" }, 0.56)
+                .to(S, { x: 1, y: 1, z: 1, duration: 0.1, ease: "back.out(2.5)" }, 0.63)
+                // softer hop back to the centre
+                .to(P, { z: 0.22, duration: 0.15, ease: "power2.out" }, 0.73)
+                .to(P, { y: 0, duration: 0.3, ease: "none" }, 0.73)
+                .to(R, { x: -0.12, duration: 0.15, ease: "power2.out" }, 0.73)
+                .to(P, { z: 0, duration: 0.15, ease: "power2.in" }, 0.88)
+                .to(R, { x: 0, duration: 0.15, ease: "power1.in" }, 0.88)
+                .to(S, { x: 1.05, y: 1.02, z: 0.92, duration: 0.04, ease: "power2.out" }, 1.03)
+                .to(S, { x: 1, y: 1, z: 1, duration: 0.07, ease: "power2.out" }, 1.07);
+            },
+          },
+        },
+      ];
+
+      // ---- folding ----
+      const prog = { p: 0 };
+      let shape = null, last = null, folded = false, tl = null;
+      // crumple: squeeze the flat sheet into a rough ball (only while no shape is folded)
+      life.crumple = 0;
+      let crumpling = false;
+      const CR = 0.32, hash = (n) => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return (s - Math.floor(s)) * 2 - 1; };
+
+      function apply() {
+        const fn = shape ? shape.fn : null;
+        const a = pos.array;
+        if (life.crumple && !folded && prog.p === 0) {
+          const c = life.crumple;
+          for (let i = 0, n = 0; i < a.length; i += 3, n++) {
+            const bx = base[i], by = base[i + 1];
+            // map the square onto a sphere: centre to the bottom, corners round to the top
+            const r = Math.min(1, Math.hypot(bx, by) / Math.SQRT2), th = Math.atan2(by, bx), ph = r * Math.PI * 0.96;
+            const tx = Math.sin(ph) * Math.cos(th) * CR, ty = Math.sin(ph) * Math.sin(th) * CR, tz = CR - Math.cos(ph) * CR;
+            const amp = 0.08 * c;
+            a[i] = bx + (tx - bx) * c + hash(n) * amp;
+            a[i + 1] = by + (ty - by) * c + hash(n + 0.37) * amp;
+            a[i + 2] = tz * c + hash(n + 0.71) * amp;
+          }
+        }
+        else if (!fn) { a.set(base); }
+        else {
+          const p = prog.p;
+          const puff = shape.name === "balloon" ? life.puff : 0, bcz = BR - BDROP;
+          // balloon scales down with the fold (about the ground point) so, inflated, it is ~0.75 across and ~0.74 tall
+          const bs = fn === balloon ? 1 - (1 - BSCALE) * smooth(0, 1, p) : 1;
+          for (let i = 0; i < a.length; i += 3) {
+            // stagger by radius (normalised so the corners land exactly at p=1): centre leads, edges trail
+            const r = Math.hypot(base[i], base[i + 1]) / Math.SQRT2;
+            const t = smooth(0, 1, p * 1.35 - r * 0.35);
+            let [x, y, z] = fn(base[i], base[i + 1], t);
+            if (puff) {
+              // inflate from the balloon centre: faces bulge most (concave -> convex), ~1.12 overall
+              const dx = x, dy = y, dz = z - bcz, len = Math.hypot(dx, dy, dz);
+              if (len > 1e-6) {
+                const { c } = faceness(dx / len, dy / len, dz / len);
+                const k = 1 + puff * (0.07 + 0.15 * c);
+                x = dx * k; y = dy * k; z = bcz + dz * k;
+              }
+              z += puff * 0.22 * bcz;   // the bottom face bulges by this much: lift so it stays on the ground
+            }
+            a[i] = x * bs; a[i + 1] = y * bs; a[i + 2] = z * bs;
+          }
+        }
+        pos.needsUpdate = true;
+        geo.computeVertexNormals();
+        geo.computeBoundingSphere();
+
+        // panel shapes (frog, pinwheel): the panels replace the (flat) sheet whenever p > 0;
+        // at p = 0 they coincide with it exactly
+        const ps = shape && shape.panels, on = !!ps && prog.p > 0;
+        mesh.visible = !on;
+        panelSets.forEach((s) => (s.mesh.visible = s.edges.visible = on && s === ps));
+        pinTilt.rotation.x = ps === pin ? PIN_TILT * prog.p : 0;
+        const bf = shape && shape.fn === balloon ? Math.min(1, prog.p * 4) : 0;
+        bCreases.visible = bf > 0;
+        bCreases.material.opacity = CREASE_OP * bf;
+        if (on) {
+          ps.update(prog.p);
+          const f = Math.min(1, prog.p * 6);   // cross-fade the sheet's creases into the panel edges
+          ps.edges.material.opacity = CREASE_OP * f;
+          creases.material.opacity = CREASE_OP * (1 - f);
+          creases.visible = f < 1;
+        } else {
+          creases.material.opacity = CREASE_OP;
+          creases.visible = true;
+        }
+      }
+
+      function crumple() {
+        if (crumpling || folded || prog.p !== 0 || (tl && tl.isActive())) return;
+        crumpling = true;
+        btn.disabled = true;
+        label.textContent = "crumpled";
+        const R = spin.rotation, r0 = { x: R.x, y: R.y, z: R.z };
+        const end = () => {
+          life.crumple = 0;
+          R.set(r0.x, r0.y, r0.z);
+          crumpling = false;
+          btn.disabled = false;
+          if (!folded) label.textContent = "square sheet";
+        };
+        const g = gsap.timeline({ onComplete: end });
+        if (reduce) {
+          g.to(life, { crumple: 1, duration: 0.1, ease: "power2.in" })
+           .to(life, { crumple: 0, duration: 0.1, ease: "power2.out" });
+          return;
+        }
+        const j = () => (Math.random() * 2 - 1) * 0.12;
+        g.to(life, { crumple: 1, duration: 0.55, ease: "power3.in" }, 0)
+         .to(R, { x: r0.x + j(), y: r0.y + j(), z: r0.z + j() * 2, duration: 0.55, ease: "power2.in" }, 0)
+         .to(life, { crumple: 0, duration: 0.9, ease: "elastic.out(1, 0.6)" }, 0.9)
+         .to(R, { x: r0.x, y: r0.y, z: r0.z, duration: 0.9, ease: "elastic.out(1, 0.6)" }, 0.9);
+      }
+
+      function fold() {
+        if (crumpling) return;
+        if (!folded) {
+          const pool = SHAPES.filter((s) => s !== last);
+          shape = pool[Math.floor(Math.random() * pool.length)];
+          last = shape;
+          folded = true;
+          btn.textContent = "Unfold";
+          label.textContent = shape.name;
+          tl && tl.kill();
+          prog.p = 0;
+          tl = gsap.to(prog, { p: 1, duration: 1.1, ease: "power3.inOut", onComplete: () => folded && shape.afterLife.start() });
+          if (reduce) tl.progress(1);
+        } else {
+          folded = false;
+          btn.textContent = "Fold";
+          shape.afterLife.stop();
+          const done = () => { if (!folded) label.textContent = "square sheet"; };
+          if (reduce) { tl.progress(0).pause(); done(); }
+          else { tl.eventCallback("onReverseComplete", done); tl.timeScale(1.4).reverse(); }
+        }
+      }
+      btn.addEventListener("click", fold);
+      addEventListener("keydown", (e) => {
+        if ((e.code === "Space" || e.key === "Enter") && e.target !== btn && !e.repeat) { e.preventDefault(); fold(); }
+      });
+
+      // ---- drag to orbit a little; click the folded teller to snap it ----
+      const drag = { on: false, x: 0, y: 0, moved: 0, rx: 0, ry: 0 };
+      const target = { rx: 0, ry: 0 };
+      const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+      canvas.addEventListener("pointerdown", (e) => {
+        drag.on = true; drag.x = e.clientX; drag.y = e.clientY; drag.moved = 0;
+        canvas.setPointerCapture(e.pointerId);
+      });
+      canvas.addEventListener("pointermove", (e) => {
+        if (!drag.on) return;
+        const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+        drag.moved += Math.abs(dx) + Math.abs(dy);
+        drag.x = e.clientX; drag.y = e.clientY;
+        target.ry = Math.max(-0.6, Math.min(0.6, target.ry + dx * 0.005));
+        target.rx = Math.max(-0.35, Math.min(0.35, target.rx + dy * 0.004));
+      });
+      canvas.addEventListener("pointerup", (e) => {
+        drag.on = false;
+        if (drag.moved < 5 && !folded && prog.p === 0 && !crumpling && !(tl && tl.isActive())) {
+          ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+          ray.setFromCamera(ndc, camera);
+          if (ray.intersectObject(mesh).length) crumple();
+          return;
+        }
+        if (drag.moved < 5 && folded && shape.afterLife.click && tl.progress() === 1) {
+          ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+          ray.setFromCamera(ndc, camera);
+          if (ray.intersectObject(shape.panels ? shape.panels.mesh : mesh).length) shape.afterLife.click();
+        }
+      });
+
+      // ---- loop ----
+      function resize() {
+        renderer.setSize(innerWidth, innerHeight, false);
+        camera.aspect = innerWidth / innerHeight;
+        camera.position.set(0, 3.2, 4.6).multiplyScalar(camera.aspect < 0.8 ? 1.45 : 1);
+        camera.lookAt(0, -0.1, 0);
+        camera.updateProjectionMatrix();
+      }
+      addEventListener("resize", resize);
+      resize();
+
+      const clock = new THREE.Clock();
+      renderer.setAnimationLoop(() => {
+        const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+        if (!drag.on) { target.rx *= 0.94; target.ry *= 0.94; }
+        drag.rx += (target.rx - drag.rx) * 0.12;
+        drag.ry += (target.ry - drag.ry) * 0.12;
+        const amp = reduce ? 0 : 1;
+        orbit.position.y = Math.sin(t * 0.9) * 0.05 * amp;
+        orbit.rotation.x = drag.rx + Math.sin(t * 0.6) * 0.025 * amp;
+        orbit.rotation.y = drag.ry + Math.sin(t * 0.45) * 0.04 * amp;
+        if (life.spin) pinSpin.rotation.z -= dt * 0.6 * life.spin * (reduce ? 0 : 1);
+        apply();
+        renderer.render(scene, camera);
+      });
+    }
+    </script>
+  </body>
+</html>
